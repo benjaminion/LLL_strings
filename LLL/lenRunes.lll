@@ -1,0 +1,93 @@
+(seq
+
+  (include "strings.lll")
+
+  ;; Precomputed function IDs.
+  (def 'do-compare          0x3da0ac79) ; compare()
+  (def 'do-compare-loop     0x20a533b0) ; compareLoop()
+  (def 'do-compare-strings  0xde6d7f88) ; compareStrings(string,string,int256)
+  (def 'do-len-bytes32      0x2aafd70a) ; lenBytes32()
+  (def 'do-len-bytes32-loop 0xb1eabc02) ; lenBytes32Loop()
+  (def 'do-len-runes        0x972f4da1) ; lenRunes(string,uint256)
+
+  ;; Memory layout
+  ;;   - from  0x00 to  0xff: Strings library working memory
+  ;;   - from 0x100 to 0x1ff: This code's working memory
+  ;;   - from 0x200         : Available to alloc
+  (def 'mem-func  0x100) ; Storage for the function selector.
+  (def 'slice1_p  0x120) ; A pointer to a slice
+  (def 'slice2_p  0x140) ; A pointer to a slice
+  (def 'scratch0  0x160) ; Temporary storage
+  (def 'scratch1  0x180) ; Temporary storage
+  (def 'scratch2  0x1a0) ; Temporary storage
+  (def 'scratch3  0x1c0) ; Temporary storage
+  (def 'gas       0x1e0) ; Gas counter
+  (def 'mem-alloc 0x200) ; The base of allocatable memory
+
+  ;; Sets the MSIZE to the base of the allocatable memory
+  (def 'uses-alloc
+    (pop (mload (- mem-alloc 0x20))))
+
+  ;; Function call handling.
+  (def 'function (function-hash code-body)
+    (when (= (mload mem-func) function-hash)
+      code-body))
+
+  (def 'uses-functions
+    (mstore
+      mem-func
+      (shr (calldataload 0x00) 224)))
+
+  ;; Exit nicely in case of errors in calling or parameters.
+  (def 'revert () (revert 0 0))
+
+  (def 'not-payable
+    (when (callvalue) (revert)))
+
+  ;; Returns the gas used by EXPR (plus a tiny bit used by the macro)
+  (def 'return-gas (expr) (return (seq [gas]:(gas) expr (- @gas (gas)))))
+
+  ;; Useful for debugging - return the whole allocated memory.
+  (def 'break () (return 0x00 (msize)))
+
+  ;; Evals to 0 for n=0, 1 for n>0, -1 for n<0
+  (def 'sign (n) (- (S> n 0) (S< n 0)))
+
+  ;; If expr evals to true ok, otherwise break
+  (def 'assert (expr) (unless expr (break)))
+  
+  ;; --------------------------------------------------------------------------
+  ;; CONTRACT CODE
+  
+  (returnlll
+    (seq not-payable uses-functions uses-alloc
+
+      (function do-len-runes
+        (seq
+
+          ;; Solidity does not include the calldata string operations
+          ;; within the function body, so neither will we.
+
+          ;; Retrieve the string lengths from the calldata.
+          [scratch0]:(calldataload (+ 0x04 (calldataload 0x04)))
+
+          ;; Allocate sufficient space for the strings in memory.
+          [scratch2]:(alloc @scratch0)
+
+          ;; Copy the string texts to the spaces we just made.
+          (calldatacopy @scratch2 (+ 0x24 (calldataload 0x04)) @scratch0)
+
+          (return-gas
+            (seq
+              ;; For fairness, we do include the costs of making the slices.
+              [slice1_p]:(new-slice)
+              (set-slice-len @slice1_p @scratch0)
+              (set-slice-ptr @slice1_p @scratch2)
+
+              (unless
+                (=  (len-runes @slice1_p) (calldataload 0x24))
+                (revert))
+              ))
+          ))
+
+      (revert))))

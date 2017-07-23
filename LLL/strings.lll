@@ -1,0 +1,262 @@
+;;; ---------------------------------------------------------------------------
+;;; [Partial] Implementation of Nick Johnson's Solidity strings library in LLL
+;;;
+;;; Ben Edgington - ben@benjaminion.xyz
+;;;
+
+(seq
+
+  ;; Temporary storage locations
+  (def 'm0 0x00)
+  (def 'm1 0x20)
+  (def 'm2 0x40)
+  (def 'm3 0x60)
+  (def 'm4 0x80)
+  (def 'm5 0xa0)
+  (def 'm6 0xc0)
+  (def 'm7 0xe0)
+
+  ;; Ensure that MSIZE is initially set above these by reading from m5
+  (pop @m5)
+  
+  (def 'inc (m n) [m]:(+ @m n))
+  (def 'inc (m) (inc m 1))
+  (def 'dec (m n) [m]:(- @m n))
+  (def 'dec (m) (dec m 1))
+  
+  ;; -------------------------------------------------------------------
+  ;; Slice handling
+  ;;
+  ;; A slice is two components:
+  ;;  1. A word containing the string's length
+  ;;  2. A word containing the memory address of the string's start
+
+  (def 'set-slice-len (_slice _len) [_slice]:_len)
+  (def 'get-slice-len (_slice) @_slice)
+  (def 'set-slice-ptr (_slice _ptr) [(+ _slice 0x20)]:_ptr)
+  (def 'get-slice-ptr (_slice) @(+ _slice 0x20))
+
+  ;; Allocates space for a slice and returns its address
+  (def 'new-slice () (alloc 0x40))
+  
+  ;; Allocates space for a slice of an existing string.
+  ;; Evaluates to the slice's address
+  (def 'new-slice (_len _ptr)
+    (seq
+      (def 'slice m0)
+      [slice]:(new-slice)
+      (set-slice-len @slice _len)
+      (set-slice-ptr @slice _ptr)
+      @slice
+      ))
+
+  ;; _offset is the... [TODO]
+  (def 'new-slice-from-calldata (_offset)
+    (seq
+
+      (def 'start_p m0)
+      (def 'len_p   m1)
+      (def 'slice_p m2)
+          
+      ;; Get parameters from the calldata
+      [start_p]:(+ (calldataload _offset) 0x04) ; Start of string data
+      [len_p]:(calldataload @start_p)           ; Length of string
+
+      ;; Create new slice
+      [slice_p]:(new-slice)
+      (set-slice-ptr @slice_p (alloc @len_p))
+      (set-slice-len @slice_p @len_p)
+      (calldatacopy (get-slice-ptr @slice_p) (+ @start_p 0x20) @len_p)
+
+      @slice_p
+      ))
+
+  ;; -------------------------------------------------------------------
+  ;; Memcpy
+
+  (def 'memcpy (_dest _src _len)
+    (seq
+
+      (def 'dest m0)
+      (def 'src  m1)
+      (def 'len  m2)
+
+      [dest]:_dest
+      [src]:_src
+      [len]:_len
+
+      (until (< @len 0x20)
+        (seq
+
+          ;; Copy a word
+          [@dest]:(mload @src)
+
+          ;; Update all the pointers
+          (inc dest 0x20)
+          (inc src  0x20)
+          (dec len  0x20)))
+
+      ;; Copy the remainder
+      ;; Note: we are re-using m2 to store the mask
+      (def 'mask m2)
+      [mask]:(- (exp 0x0100 (- 0x20 @len)) 1)
+      [@dest]:(or (and (mload @dest) @mask) (and (mload @src) (~ @mask)))
+      )
+    )
+
+  ;; -------------------------------------------------------------------
+  ;; Length of null terminated bytes in a 32 byte word.
+
+  (def 'len-bytes32 (_word)
+
+    (seq
+      (def 'word m1)
+
+      [word]:_word
+
+      (if @word
+        ;; THEN
+        ;; Use stack for efficiency.
+        ;; Beware - arguments are evaluated from last to first!
+        (- 32
+          (iszero (and @word 0xff))
+          (if (and @word 0xffff) 0
+            (seq
+              [word]:(/ @word 0x10000)
+              2))
+          (if (and @word 0xffffffff) 0
+            (seq
+              [word]:(/ @word 0x100000000)
+              4))
+          (if (and @word 0xffffffffffffffff) 0
+            (seq
+              [word]:(/ @word 0x10000000000000000)
+              8))
+          ;; The optimiser translates the following to (- (exp 2 0x80) 1)
+          ;; Nobody knows why it does this. It saves 10 bytes, but at
+          ;; huge cost. It doesn't change the other one to (exp 2 0x80).
+          (if (and @word 0xffffffffffffffffffffffffffffffff) 0
+            (seq
+              [word]:(/ @word 0x100000000000000000000000000000000)
+              16))
+          )
+        ;; ELSE
+        0
+        )))
+          
+  ;; ===================================================================
+  ;; Functions on slices
+  
+  ;; -------------------------------------------------------------------
+  ;; Length of slice in runes
+
+  (def 'len-runes (_slice)
+    (seq
+
+      (def 'ptr m0)
+      (def 'end m1)
+      (def 'ret m2)
+      (def 'chr m3)
+      (def 'slice m4)
+
+      [slice]:_slice
+      [ptr]:(get-slice-ptr @slice)
+      [end]:(+ @ptr (get-slice-len @slice))
+      [ret]:0
+
+      (while (< @ptr @end)
+        (seq
+          (inc ret)
+          
+          ;; 1. The fastest version: with new switch expr and ASM
+          ;;    Looks dangerous! Proof-of-concept only.
+          ;; (raw
+          ;;   (byte 0 (mload @ptr))
+          ;;   (inc ptr (switch
+          ;;              (< (asm DUP2) 0x80) 1
+          ;;              (< (asm DUP2) 0xE0) 2
+          ;;              (< (asm DUP2) 0xF0) 3
+          ;;              (< (asm DUP2) 0xF8) 4
+          ;;              (< (asm DUP2) 0xFC) 5
+          ;;              6)))
+          
+          ;; 2. The next fastest: with new switch expr
+          ;; [chr]:(byte 0 (mload @ptr))
+          ;; (inc ptr (switch
+          ;;            (< @chr 0x80) 1
+          ;;            (< @chr 0xE0) 2
+          ;;            (< @chr 0xF0) 3
+          ;;            (< @chr 0xF8) 4
+          ;;            (< @chr 0xFC) 5
+          ;;            6))
+
+          ;; 3. The slowest: original nested ifs
+          [chr]:(byte 0 (mload @ptr))
+          (inc ptr
+            (if (< @chr 0x80) 1
+              (if (< @chr 0xE0) 2
+                (if (< @chr 0xF0) 3
+                  (if (< @chr 0xF8) 4
+                    (if (< @chr 0xFC) 5
+                      6))))))
+          ))
+      @ret)
+    )
+
+  ;; -------------------------------------------------------------------
+  ;; Comparison
+
+  (def 'compare (_s1 _s2)
+
+    (seq
+
+      (def 'shortest m0)
+      (def 'ptr1 m1)
+      (def 'ptr2 m2)
+      (def 'idx  m3)
+      (def 'diff m4)
+      (def 'mask m5)
+      (def 's1   m6)
+      (def 's2   m7)
+      
+      ;; The following is an optimisation. The input args are evaluated
+      ;; multiple times below, which is very inefficient if they are
+      ;; complex expressions
+      [s1]:_s1
+      [s2]:_s2
+
+      [shortest]:(if (< (get-slice-len @s1) (get-slice-len @s2))
+                   (get-slice-len @s1) (get-slice-len @s2))
+      [ptr1]:(get-slice-ptr @s1)
+      [ptr2]:(get-slice-ptr @s2)
+      [idx]:0
+      [diff]:0
+
+      ;; Exit the loop after a difference is found or we reach the end.
+      (while (and (! @diff) (< @idx @shortest)) ; "and" is quicker than "&&"
+
+        (seq
+          (unless (= (mload @ptr1) (mload @ptr2))
+
+            ;; Mask out irrelevant bytes and compare
+            (seq
+              [mask]:(~ (- (exp 0x0100 (- 0x20 (- @shortest @idx))) 1))
+              [diff]:(- (& (mload @ptr1) @mask) (& (mload @ptr2) @mask))
+              ))
+
+          { (inc ptr1 32) (inc ptr2 32) (inc idx 32) }))
+
+      ;; Final value
+      (if @diff @diff (- (get-slice-len @s1) (get-slice-len @s2)))))
+
+  ;; -------------------------------------------------------------------
+  ;; Equals
+
+  (def 'equals (_s1 _s2)
+    (! (compare _s1 _s2)))
+
+
+  ;; -------------------------------------------------------------------
+  ;; Equals
+
+  )
