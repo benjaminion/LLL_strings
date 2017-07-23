@@ -16,8 +16,8 @@
   (def 'm6 0xc0)
   (def 'm7 0xe0)
 
-  ;; Ensure that MSIZE is initially set above these by reading from m5
-  (pop @m5)
+  ;; Ensure that MSIZE is initially set above these by reading from m7
+  (pop @m7)
   
   (def 'inc (m n) [m]:(+ @m n))
   (def 'inc (m) (inc m 1))
@@ -221,7 +221,7 @@
       
       ;; The following is an optimisation. The input args are evaluated
       ;; multiple times below, which is very inefficient if they are
-      ;; complex expressions
+      ;; complex expressions, so we cache them in memory.
       [s1]:_s1
       [s2]:_s2
 
@@ -254,9 +254,5 @@
 
   (def 'equals (_s1 _s2)
     (! (compare _s1 _s2)))
-
-
-  ;; -------------------------------------------------------------------
-  ;; Equals
 
   )
